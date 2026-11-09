@@ -1,56 +1,89 @@
 # Supernova DB
 
-Supernova DB is a custom Rust database project built to be fast, secure, beginner-friendly, and easy to extend.
+Supernova DB is an advanced custom database project written in Rust. It is designed to be beginner-friendly, secure enough for experimentation, and powerful enough to serve as a foundation for a custom protocol-driven storage engine.
 
-It includes:
-- a custom binary protocol
-- persistent key-value storage
-- a simple server mode
-- a CLI for quick developer use
-- a clean Rust codebase suitable for learning and experimentation
+## Highlights
 
-## What makes it special
+- Custom binary protocol with a protocol magic header
+- Snapshot persistence for fast recovery
+- Write-ahead log (WAL) journaling for durability
+- Multi-table data model
+- CLI for local operations
+- TCP server mode for custom client connections
+- JSON-first request/response schema for easy learning
 
-Supernova DB is designed around a simple philosophy:
-- custom protocol, not just a wrapper around a library
-- custom storage format, not just a black-box ODM
-- easy to read, easy to teach, easy to extend
-- suitable for learning Rust and database design
+## Project goals
+
+Supernova DB is designed with a clear philosophy:
+
+- keep the protocol custom and understandable
+- keep persistence transparent and explicit
+- make the code easy to read and teach
+- build a solid base for custom database features without a huge framework
 
 ## Quick start
 
 ```bash
 cargo build
-cargo run -- set user alice
-cargo run -- get user
-cargo run -- list
+cargo run -- tables
+cargo run -- create-table users
+cargo run -- set users alice '{"name":"Alice","role":"admin"}'
+cargo run -- get users alice
+cargo run -- list users
 ```
 
 ## Server mode
 
 ```bash
-cargo run -- serve --host 127.0.0.1 --port 8080
+cargo run -- serve --host 127.0.0.1 --port 8080 --token demo-token
 ```
 
-Then connect using the custom protocol with any client that sends JSON frames using the `SDB1` magic header.
+Clients can send framed JSON payloads with the `SDB2` protocol header. A request example looks like:
+
+```json
+{
+  "op": "set",
+  "table": "users",
+  "key": "alice",
+  "value": {"name":"Alice","role":"admin"},
+  "token": "demo-token"
+}
+```
 
 ## Structure
 
 - `src/lib.rs` — library exports
-- `src/storage.rs` — persistent storage engine
-- `src/protocol.rs` — custom protocol encoding and decoding
-- `src/main.rs` — CLI and server entry point
+- `src/storage.rs` — advanced persistent storage layer with WAL + snapshots
+- `src/protocol.rs` — custom client/server protocol
+- `src/main.rs` — CLI and TCP server handling
+- `tests/basic.rs` — integration tests
 
-## Example payloads
+## Current capabilities
 
-Set a value:
+- create and delete tables
+- set, get, and delete key/value entries
+- list rows in a table
+- list all tables
+- durable writes using WAL
+- data snapshot recovery
+- custom network protocol over TCP
 
-```json
-{"op":"set","key":"name","value":"supernova"}
-```
+## Roadmap
 
-Get a value:
+The next milestone can include:
 
-```json
-{"op":"get","key":"name"}
+- indexed lookups
+- transactions
+- replication hooks
+- binary typed values
+- query parser
+- authentication + roles
+- scavenger / compaction for WAL
+- SQL-like subset support
+
+## Build
+
+```bash
+cargo test
+cargo run -- --help
 ```

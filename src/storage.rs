@@ -1,23 +1,26 @@
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: &[u8; 4] = b"SDB1";
+pub const MAGIC: &[u8; 4] = b"SDB2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub op: String,
+    pub table: String,
     pub key: String,
-    pub value: Option<String>,
+    pub value: Option<serde_json::Value>,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub message: String,
-    pub value: Option<String>,
+    pub value: Option<serde_json::Value>,
+    pub data: Option<serde_json::Value>,
 }
 
 pub fn encode_request(request: &Request) -> Vec<u8> {
-    let payload = serde_json::to_vec(request).expect("request serialization should never fail");
+    let payload = serde_json::to_vec(request).expect("request serialization must succeed");
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(MAGIC);
     frame.extend_from_slice(&((payload.len() as u32).to_be_bytes()));
@@ -47,7 +50,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, String> {
 }
 
 pub fn encode_response(response: &Response) -> Vec<u8> {
-    let payload = serde_json::to_vec(response).expect("response serialization should never fail");
+    let payload = serde_json::to_vec(response).expect("response serialization must succeed");
     let mut frame = Vec::with_capacity(8 + payload.len());
     frame.extend_from_slice(MAGIC);
     frame.extend_from_slice(&((payload.len() as u32).to_be_bytes()));
