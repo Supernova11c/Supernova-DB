@@ -1,9 +1,9 @@
 [package]
 name = "supernova_db"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Supernova DB — a resilient Rust database with transaction support, indexing, schema metadata, and query operations"
+description = "Supernova DB — a custom Rust database with atomic WAL transactions, secondary indexes, and a bounded network protocol"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
