@@ -9,12 +9,13 @@ Supernova DB is a beginner-friendly Rust database starter demonstrating a **mult
 - an `SDB3` length-prefixed custom TCP protocol
 - atomic snapshot replacement and in-process transactions
 
-This is an educational starter—not a replacement for SQLite, PostgreSQL, or mature search/vector databases. It stores a JSON snapshot and is intended for small, single-process experiments. It has not been benchmarked or security-audited. Vector search is an exact scan. The server's optional shared token is plaintext; bind to loopback or use a trusted network/TLS proxy. Do not rely on this version for critical data.
+This is an educational starter—not a replacement for SQLite, PostgreSQL, or mature search/vector databases. It stores a JSON snapshot and is intended for small, single-process experiments. The TCP token is plaintext; bind to loopback or use a trusted network. It has not been independently benchmarked or audited.
 
 ## Run it
 
 ```sh
 cargo test
+cargo run --example quickstart
 cargo run -- create-collection articles
 cargo run -- put articles item-1 '{"title":"Rust DB","body":"A small searchable database","embedding":[0.1,0.2,0.3]}'
 cargo run -- create-text-index articles body
@@ -38,6 +39,6 @@ This supports a single equality predicate and a non-negative limit, not full SQL
 
 ## Network protocol
 
-Start the local server with `cargo run -- serve --host 127.0.0.1 --port 8080`. Each connection carries one request. Frames contain four bytes `SDB3`, a four-byte unsigned big-endian payload length, then JSON (up to 1 MiB). `--token` enables a shared plaintext token; it does not encrypt traffic. The TCP server is a starter implementation, not a hardened public service.
+Start the local server with `cargo run -- serve --host 127.0.0.1 --port 8080`. Each connection carries one request. Frames contain four bytes `SDB3`, a four-byte unsigned big-endian payload length, then JSON payload (maximum 1 MiB). An optional `--token` is a shared plaintext token, not encryption.
 
-The library API and tests are intended to be the easiest place to learn and extend the implementation. For production use, this project needs independent correctness and crash testing, benchmarks, file locking, a WAL/checkpoint design, TLS and stronger authentication, limits/backpressure, and scalable on-disk indexes.
+The library API and `examples/quickstart.rs` are the easiest places to learn and extend the implementation. For production use, it needs independent correctness and crash testing, benchmarks, file locking, a write-ahead log, authenticated encrypted transport, and scalable on-disk indexes.
