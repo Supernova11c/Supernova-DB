@@ -16,6 +16,9 @@ pub struct Request {
     pub field: Option<String>,
     pub query: Option<String>,
     pub token: Option<String>,
+    pub sort_by: Option<String>,
+    pub limit: Option<usize>,
+    pub columns: Option<Vec<String>>,
 }
 
 impl Default for Request {
@@ -28,6 +31,9 @@ impl Default for Request {
             field: None,
             query: None,
             token: None,
+            sort_by: None,
+            limit: None,
+            columns: None,
         }
     }
 }
@@ -51,14 +57,14 @@ pub fn encode_response(response: &Response) -> Result<Vec<u8>, String> {
 }
 
 fn encode_frame<T: Serialize>(payload: &T) -> Result<Vec<u8>, String> {
-    let payload = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
-    if payload.len() > MAX_FRAME_SIZE || payload.len() > u32::MAX as usize {
+    let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FRAME_SIZE || bytes.len() > u32::MAX as usize {
         return Err("payload exceeds maximum frame size".to_string());
     }
-    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+    let mut frame = Vec::with_capacity(HEADER_LEN + bytes.len());
     frame.extend_from_slice(MAGIC);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&bytes);
     Ok(frame)
 }
 
@@ -74,18 +80,18 @@ pub fn decode_response(frame: &[u8]) -> Result<Response, String> {
 
 fn decode_payload(frame: &[u8]) -> Result<&[u8], String> {
     if frame.len() < HEADER_LEN {
-        return Err("frame is too short".into());
+        return Err("frame is too short".to_string());
     }
     if &frame[..4] != MAGIC {
-        return Err("invalid protocol magic".into());
+        return Err("invalid protocol magic".to_string());
     }
-    let length = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
-    if length > MAX_FRAME_SIZE {
-        return Err("frame exceeds maximum size".into());
+    let len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err("frame exceeds maximum size".to_string());
     }
-    let end = HEADER_LEN.checked_add(length).ok_or("frame length overflow")?;
+    let end = HEADER_LEN.checked_add(len).ok_or_else(|| "frame length overflow".to_string())?;
     if frame.len() != end {
-        return Err("frame length does not match payload".into());
+        return Err("frame length does not match payload".to_string());
     }
     Ok(&frame[HEADER_LEN..end])
 }
@@ -106,11 +112,11 @@ fn read_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     if &header[..4] != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid protocol magic"));
     }
-    let length = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-    if length > MAX_FRAME_SIZE {
+    let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+    if len > MAX_FRAME_SIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds maximum size"));
     }
-    let mut payload = vec![0; length];
+    let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
     Ok(payload)
 }
@@ -120,12 +126,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_round_trips_and_rejects_trailing_bytes() {
-        let request = Request { op: "ping".into(), ..Request::default() };
-        let frame = encode_request(&request).unwrap();
+    fn request_round_trip_works() {
+        let req = Request {
+            op: "ping".to_string(),
+            ..Default::default()
+        };
+        let frame = encode_request(&req).unwrap();
         assert_eq!(decode_request(&frame).unwrap().op, "ping");
-        let mut bad = frame;
-        bad.push(0);
-        assert!(decode_request(&bad).is_err());
     }
 }

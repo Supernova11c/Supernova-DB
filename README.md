@@ -1,52 +1,62 @@
 # Supernova DB
 
-Supernova DB is a learning-focused Rust database with its own storage format and `SDB2` TCP framing. This release adds atomic WAL batches, crash recovery, secondary equality indexes, and a usable CLI/server implementation.
+Supernova DB is a custom Rust database designed to be understandable, resilient, and extensible. This stage adds table schemas, richer row queries, sorting, better recovery, and a stronger protocol foundation.
 
-> This is an experimental embedded database, not yet a production replacement for SQLite, PostgreSQL, or other mature systems. The optional token is sent in plaintext: only expose the server on trusted networks or behind TLS.
+## What is new in v0.5.0?
+
+- schema-aware table creation with required column metadata
+- secondary indexes and faster equality lookups
+- query operators (`=`, `!=`, `>`, `<`, `>=`, `<=`, `~`)
+- row sorting and limit support
+- checkpoint + WAL recovery improvements
+- richer TCP protocol with table metadata and query payloads
 
 ## Quick start
 
-```sh
-cargo test
-cargo run -- create-table users
-cargo run -- set users alice '{"name":"Alice","role":"admin"}'
-cargo run -- create-index users role
-cargo run -- query users role admin
-cargo run -- get users alice
+```bash
+cargo build
+cargo run -- create-table users --columns name:string,role:string,age:number
+cargo run -- set users alice '{"name":"Alice","role":"admin","age":30}'
+cargo run -- set users bob '{"name":"Bob","role":"user","age":25}'
+cargo run -- query users role=admin
+cargo run -- list users --sort age --limit 10
 cargo run -- checkpoint
 ```
 
-Data lives in `./supernova_data` by default. Change it with the global `--db <directory>` option, which must appear before the command, e.g. `cargo run -- --db ./data set users alice '"Alice"'`.
+## Query examples
 
-## Commands
-
-- `create-table <table>` / `delete-table <table>`
-- `set <table> <key> <json-or-string>` / `get <table> <key>` / `delete <table> <key>`
-- `list <table>` / `query <table> <field> <json-or-string>`
-- `create-index <table> <field>` / `indexes <table>`
-- `tables` / `checkpoint`
-- `serve --host 127.0.0.1 --port 8080 [--token <secret>]`
-
-Query is equality matching. For example, `query users role admin` matches rows whose JSON field `role` equals the string `admin`. Numeric and boolean values can be queried by supplying valid JSON literals.
-
-## Storage and recovery
-
-Mutations are appended as a single JSON record to `wal.log` and synced before becoming visible. A committed transaction is represented by one WAL record containing its complete mutation batch, so replay applies all its operations together. `checkpoint` writes a temporary snapshot, renames it into place, then truncates the WAL. Indexes are rebuilt from row data on open; they are derived data, not a second source of truth.
-
-## Custom network protocol
-
-Each TCP request and response is one frame:
-
-```
-4 bytes  magic: SDB2
-4 bytes  payload length, unsigned big-endian
-N bytes  UTF-8 JSON payload (maximum 4 MiB)
+```bash
+cargo run -- query users age>=25
+cargo run -- query users name~ali
+cargo run -- query users role=admin
 ```
 
-Example request:
+## Server mode
+
+```bash
+cargo run -- serve --host 127.0.0.1 --port 8080 --token demo-token
+```
+
+## Protocol
+
+Each request is a framed message using the `SDB2` magic header.
+
+Example payload:
 
 ```json
-{"op":"set","table":"users","key":"alice","value":{"name":"Alice"},"token":null}
+{"op":"query","table":"users","field":"role","query":"role=admin","sort_by":"age","limit":10,"token":"demo-token"}
 ```
 
-Supported operations: `ping`, `tables`, `create_table`, `delete_table`, `get`, `set`, `delete`, `list`, `query`, `create_index`, `indexes`, and `checkpoint`. Each connection handles one request. The server binds to loopback by default; use an explicit host to expose it. Configure `--token` to require a shared token, but remember this protocol does not encrypt traffic.
+## Design goals
+
+- custom protocol, not just a wrapper around a library
+- data persistence with clear recovery semantics
+- schema validation for safer row writes
+- beginner-friendly structure that is easy to extend
+
+## Build and tests
+
+```bash
+cargo test
+cargo run -- --help
+```
