@@ -1,48 +1,43 @@
 # Supernova DB
 
-Supernova DB is an experimental, beginner-friendly **multi-model Rust database**. One collection can hold JSON documents and expose them through several access patterns:
+Supernova DB is a beginner-friendly Rust database starter demonstrating a **multi-model API** over JSON documents:
 
-- **Document / user data:** store and retrieve JSON by collection and ID.
-- **Keyword search:** build field-specific inverted indexes and rank documents by matching terms.
-- **Vector search:** store numeric embedding arrays and find nearest vectors by cosine similarity (exact scan).
-- **SQL-like queries:** run a small, deliberately limited `SELECT` syntax over document fields.
-- **Custom client protocol:** length-bounded `SDB3` JSON frames over TCP.
+- collections of JSON documents keyed by ID
+- keyword search with a rebuildable inverted index
+- vector similarity search using exact cosine similarity
+- a small, deliberately limited `SELECT` query subset
+- an `SDB3` length-prefixed custom TCP protocol
+- atomic snapshot replacement and in-process transactions
 
-This is a functional learning and prototyping foundation, **not yet a replacement for SQLite, PostgreSQL, or mature vector/search databases**. It has not been independently benchmarked or audited. Current storage is a single-process JSON snapshot; vector search is exact scan; TCP token authentication is plaintext and does not provide TLS. Use backups and do not expose the server to untrusted networks.
+This is an educational starter—not a replacement for SQLite, PostgreSQL, or mature search/vector databases. It stores a JSON snapshot and is intended for small, single-process experiments. It has not been benchmarked or security-audited. Vector search is an exact scan. The server's optional shared token is plaintext; bind to loopback or use a trusted network/TLS proxy. Do not rely on this version for critical data.
 
-## Quick start
+## Run it
 
 ```sh
 cargo test
 cargo run -- create-collection articles
-cargo run -- put articles doc-1 '{"title":"Rust database","body":"Fast searchable storage","embedding":[0.1,0.2,0.3]}'
+cargo run -- put articles item-1 '{"title":"Rust DB","body":"A small searchable database","embedding":[0.1,0.2,0.3]}'
 cargo run -- create-text-index articles body
 cargo run -- search-text articles body searchable
 cargo run -- create-vector-index articles embedding 3
 cargo run -- vector-search articles embedding '[0.1,0.2,0.25]' --limit 5
-cargo run -- sql 'SELECT * FROM articles WHERE title = "Rust database" LIMIT 10'
+cargo run -- sql 'SELECT * FROM articles WHERE title = "Rust DB" LIMIT 10'
 ```
 
-The database directory defaults to `supernova_data`; choose another with global `--db` before the command (`cargo run -- --db ./data ...`). Documents are JSON and IDs are unique inside each collection.
+Data is stored in `supernova_data` by default. Choose a directory with `--db` before the command: `cargo run -- --db ./my-data collections`.
 
 ## SQL subset
 
-Supported form:
+Supported syntax is intentionally narrow:
 
 ```sql
-SELECT * FROM collection [WHERE field (= | != | > | < | >= | <= | ~) literal] [LIMIT n]
+SELECT * FROM collection [WHERE field = JSON_VALUE] [LIMIT N]
 ```
 
-`~` performs case-insensitive substring matching on strings. Literals may be JSON values or unquoted strings. This is intentionally a small query language, not full SQL: joins, DDL, transactions, aggregation, and SQL wire compatibility are not implemented.
-
-## Indexing
-
-Create a keyword index explicitly with `create-text-index <collection> <field>`. Search tokenizes Unicode alphanumeric terms, lowercases them, and ranks by term frequency. Vector fields are declared with `create-vector-index <collection> <field> <dimensions>`; writes validate the dimension and searches rank by cosine similarity. These indexes are rebuilt from persisted documents when the database opens; vector similarity currently scans all documents.
+This supports a single equality predicate and a non-negative limit, not full SQL. It does not support joins, SQL DDL, aggregations, prepared statements, or a SQL wire protocol.
 
 ## Network protocol
 
-Run locally with `cargo run -- serve --host 127.0.0.1 --port 8080`. Each connection handles one request. A frame is `SDB3` (4 bytes), a big-endian unsigned 32-bit JSON payload length, then JSON payload (maximum 1 MiB). Optionally set `--token`; it is a shared plaintext token, **not encryption**. Bind only to a trusted interface or place behind a properly configured TLS proxy.
+Start the local server with `cargo run -- serve --host 127.0.0.1 --port 8080`. Each connection carries one request. Frames contain four bytes `SDB3`, a four-byte unsigned big-endian payload length, then JSON (up to 1 MiB). `--token` enables a shared plaintext token; it does not encrypt traffic. The TCP server is a starter implementation, not a hardened public service.
 
-## Roadmap
-
-Before production use, Supernova DB needs extensive correctness and crash testing, benchmarks, file locking, robust WAL/checkpoint design, TLS and stronger auth, bounded worker/backpressure handling, migrations, and scalable on-disk indexes. The current implementation keeps those limitations explicit while providing a clear base to learn and extend.
+The library API and tests are intended to be the easiest place to learn and extend the implementation. For production use, this project needs independent correctness and crash testing, benchmarks, file locking, a WAL/checkpoint design, TLS and stronger authentication, limits/backpressure, and scalable on-disk indexes.
