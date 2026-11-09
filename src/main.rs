@@ -92,12 +92,11 @@ impl SupernovaDb {
 
     pub fn create_table_with_schema(&mut self, table: &str, columns: &[String]) -> Result<(), Box<dyn Error>> {
         validate_name(table, "table")?;
-        let schema_columns: Vec<ColumnSpec> = columns.iter().map(|c| ColumnSpec {
-            name: c.to_string(),
-            kind: "string".to_string(),
-            required: false,
-        }).collect();
-        self.commit_mutations(vec![Mutation::CreateTable { table: table.into(), columns: schema_columns }])
+        let schema_columns = columns
+            .iter()
+            .map(|name| ColumnSpec { name: name.clone(), kind: infer_kind_from_name(name), required: false })
+            .collect();
+        self.commit_mutations(vec![Mutation::CreateTable { table: table.to_string(), columns: schema_columns }])
     }
 
     pub fn delete_table(&mut self, table: &str) -> Result<bool, Box<dyn Error>> {
@@ -112,13 +111,17 @@ impl SupernovaDb {
         self.tables.keys().cloned().collect()
     }
 
+    pub fn describe(&self, table: &str) -> Option<Vec<ColumnSpec>> {
+        self.tables.get(table).map(|meta| meta.schema.columns.clone())
+    }
+
     pub fn create_index(&mut self, table: &str, field: &str) -> Result<(), Box<dyn Error>> {
         validate_name(table, "table")?;
         validate_name(field, "field")?;
         if !self.tables.contains_key(table) {
             return Err(invalid_input("table does not exist"));
         }
-        if self.tables[table].schema.indexes.contains(&field.to_string()) {
+        if self.tables[table].schema.indexes.iter().any(|name| name == field) {
             return Ok(());
         }
         self.commit_mutations(vec![Mutation::CreateIndex { table: table.to_string(), field: field.to_string() }])
@@ -131,7 +134,7 @@ impl SupernovaDb {
     pub fn set(&mut self, table: &str, key: String, value: Value) -> Result<(), Box<dyn Error>> {
         validate_name(table, "table")?;
         validate_key(&key)?;
-        let meta = self.tables.entry(table.to_string()).or_insert_with(|| TableMeta::default());
+        let meta = self.tables.entry(table.to_string()).or_default();
         validate_value_against_schema(&meta.schema, &value)?;
         self.commit_mutations(vec![Mutation::Set { table: table.to_string(), key, value }])
     }
@@ -150,9 +153,11 @@ impl SupernovaDb {
     }
 
     pub fn list(&self, table: &str, sort_by: Option<&str>, limit: Option<usize>) -> Vec<(String, Value)> {
-        let mut entries: Vec<_> = self.tables.get(table).map(|meta| {
-            meta.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        }).unwrap_or_default();
+        let mut entries: Vec<_> = self
+            .tables
+            .get(table)
+            .map(|meta| meta.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
 
         if let Some(field) = sort_by {
             entries.sort_by(|a, b| compare_sort_value(&a.1, &b.1, field));
@@ -163,41 +168,56 @@ impl SupernovaDb {
         if let Some(limit) = limit {
             entries.truncate(limit);
         }
+
         entries
     }
 
     pub fn query(&self, table: &str, predicate: &str) -> Vec<(String, Value)> {
-        if let Some((field, expected)) = parse_predicate(predicate) {
-            let expected = normalize_predicate_value(&expected);
-            let table_rows = match self.tables.get(table) {
-                Some(meta) => &meta.rows,
-                None => return Vec::new(),
-            };
-
-            let mut matched: Vec<_> = table_rows
-                .iter()
-                .filter(|(_, row)| row_matches(row, &field, &expected))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            matched.sort_by(|a, b| a.0.cmp(&b.0));
-            matched
-        } else {
-            Vec::new()
+        let mut results = Vec::new();
+        if let Some((field, op, raw_value)) = parse_predicate(predicate) {
+            let value = parse_query_value(&raw_value);
+            for (key, row) in self.tables.get(table).into_iter().flat_map(|meta| meta.rows.iter()) {
+                if row_matches_field(row, &field, &op, &value) {
+                    results.push((key.clone(), row.clone()));
+                }
+            }
         }
-    }
-
-    pub fn query_eq(&self, table: &str, field: &str, expected: &Value) -> Vec<(String, Value)> {
-        let mut matched: Vec<_> = self.tables.get(table)
-            .map(|meta| meta.rows.iter().filter(|(_, row)| row_matches(row, field, expected)).map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        matched.sort_by(|a, b| a.0.cmp(&b.0));
-        matched
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
     }
 
     pub fn checkpoint(&mut self) -> Result<(), Box<dyn Error>> {
         self.persist_snapshot()?;
-        let file = OpenOptions::new().write(true).truncate(true).open(&self.wal_path)?;
-        file.sync_all()?;
+        let mut wal = OpenOptions::new().write(true).truncate(true).open(&self.wal_path)?;
+        wal.sync_all()?;
+        Ok(())
+    }
+
+    pub fn backup(&self, destination: &Path) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(destination)?;
+        let snapshot_dst = destination.join("snapshot.json");
+        let wal_dst = destination.join("wal.log");
+        fs::copy(&self.snapshot_path, snapshot_dst)?;
+        if self.wal_path.exists() {
+            fs::copy(&self.wal_path, wal_dst)?;
+        }
+        Ok(())
+    }
+
+    pub fn restore(&mut self, source: &Path) -> Result<(), Box<dyn Error>> {
+        let snapshot_src = source.join("snapshot.json");
+        let wal_src = source.join("wal.log");
+        if snapshot_src.exists() {
+            let bytes = fs::read(snapshot_src)?;
+            let snapshot: DbSnapshot = serde_json::from_slice(&bytes)?;
+            self.tables = snapshot.tables;
+            self.persist_snapshot()?;
+        }
+        if wal_src.exists() {
+            fs::copy(wal_src, &self.wal_path)?;
+            self.replay_wal()?;
+        }
+        self.rebuild_indexes();
         Ok(())
     }
 
@@ -211,16 +231,18 @@ impl SupernovaDb {
     }
 
     fn commit_mutations(&mut self, mutations: Vec<Mutation>) -> Result<(), Box<dyn Error>> {
-        if mutations.is_empty() { return Ok(()); }
+        if mutations.is_empty() {
+            return Ok(());
+        }
         let next = self.sequence + 1;
-        let record = WalRecord { version: 1, sequence: next, mutations };
+        let record = WalRecord { version: 1, sequence: next, mutations: mutations.clone() };
         let bytes = serde_json::to_vec(&record)?;
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.wal_path)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+        let mut wal = OpenOptions::new().create(true).append(true).open(&self.wal_path)?;
+        wal.write_all(&bytes)?;
+        wal.write_all(b"\n")?;
+        wal.sync_all()?;
         self.sequence = next;
-        for mutation in &record.mutations {
+        for mutation in &mutations {
             apply_mutation(&mut self.tables, mutation);
         }
         self.rebuild_indexes();
@@ -229,16 +251,20 @@ impl SupernovaDb {
     }
 
     fn load_snapshot(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.snapshot_path.exists() { return Ok(()); }
-        let contents = fs::read_to_string(&self.snapshot_path)?;
-        if contents.trim().is_empty() { return Ok(()); }
-        let snapshot: DbSnapshot = serde_json::from_str(&contents)?;
+        if !self.snapshot_path.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read_to_string(&self.snapshot_path)?;
+        if bytes.trim().is_empty() {
+            return Ok(());
+        }
+        let snapshot: DbSnapshot = serde_json::from_str(&bytes)?;
         self.tables = snapshot.tables;
         Ok(())
     }
 
     fn persist_snapshot(&self) -> Result<(), Box<dyn Error>> {
-        let snapshot = DbSnapshot { version: 5, tables: self.tables.clone() };
+        let snapshot = DbSnapshot { version: 6, tables: self.tables.clone() };
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         let temp = self.root.join("snapshot.json.tmp");
         let mut file = File::create(&temp)?;
@@ -249,20 +275,26 @@ impl SupernovaDb {
     }
 
     fn replay_wal(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.wal_path.exists() { return Ok(()); }
-        let file = File::open(&self.wal_path)?;
-        let reader = BufReader::new(file);
+        if !self.wal_path.exists() {
+            return Ok(());
+        }
+        let reader = BufReader::new(File::open(&self.wal_path)?);
         for line in reader.lines() {
             let line = line?;
-            if line.trim().is_empty() { continue; }
+            if line.trim().is_empty() {
+                continue;
+            }
             let record: WalRecord = serde_json::from_str(&line)?;
-            if record.version != 1 { continue; }
-            if record.sequence <= self.sequence { continue; }
+            if record.version != 1 {
+                continue;
+            }
+            if record.sequence <= self.sequence {
+                continue;
+            }
             self.sequence = record.sequence;
             for mutation in &record.mutations {
                 apply_mutation(&mut self.tables, mutation);
             }
-            self.rebuild_indexes();
         }
         Ok(())
     }
@@ -287,7 +319,7 @@ impl<'a> Transaction<'a> {
     pub fn set(&mut self, table: &str, key: String, value: Value) -> Result<(), Box<dyn Error>> {
         validate_name(table, "table")?;
         validate_key(&key)?;
-        let meta = self.working.entry(table.to_string()).or_insert_with(|| TableMeta::default());
+        let meta = self.working.entry(table.to_string()).or_default();
         validate_value_against_schema(&meta.schema, &value)?;
         let mutation = Mutation::Set { table: table.to_string(), key: key.clone(), value: value.clone() };
         apply_mutation(&mut self.working, &mutation);
@@ -316,8 +348,8 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn rollback(mut self) {
-        self.mutations.clear();
         self.finished = true;
+        self.mutations.clear();
     }
 }
 
@@ -351,7 +383,7 @@ fn apply_mutation(tables: &mut BTreeMap<String, TableMeta>, mutation: &Mutation)
         }
         Mutation::CreateIndex { table, field } => {
             if let Some(meta) = tables.get_mut(table) {
-                if !meta.schema.indexes.contains(field) {
+                if !meta.schema.indexes.iter().any(|name| name == field) {
                     meta.schema.indexes.push(field.clone());
                     meta.schema.indexes.sort();
                 }
@@ -362,13 +394,9 @@ fn apply_mutation(tables: &mut BTreeMap<String, TableMeta>, mutation: &Mutation)
 
 fn update_schema_columns(schema: &mut TableSchema, value: &Value) {
     if let Value::Object(map) = value {
-        for (field, val) in map {
-            if !schema.columns.iter().any(|c| c.name == *field) {
-                schema.columns.push(ColumnSpec {
-                    name: field.clone(),
-                    kind: infer_kind(val),
-                    required: false,
-                });
+        for (field, field_value) in map {
+            if !schema.columns.iter().any(|col| col.name == *field) {
+                schema.columns.push(ColumnSpec { name: field.clone(), kind: infer_kind(field_value), required: false });
             }
         }
         schema.columns.sort_by(|a, b| a.name.cmp(&b.name));
@@ -383,6 +411,14 @@ fn infer_kind(value: &Value) -> String {
         Value::String(_) => "string".to_string(),
         Value::Array(_) => "array".to_string(),
         Value::Object(_) => "object".to_string(),
+    }
+}
+
+fn infer_kind_from_name(name: &str) -> String {
+    if name.contains("age") || name.contains("count") || name.contains("amount") || name.contains("id") {
+        "number".to_string()
+    } else {
+        "string".to_string()
     }
 }
 
@@ -408,7 +444,7 @@ fn validate_value_against_schema(schema: &TableSchema, value: &Value) -> Result<
     if schema.columns.is_empty() {
         return Ok(());
     }
-    let object = value.as_object().ok_or_else(|| invalid_input("value must be an object when table schema is enforced"))?;
+    let object = value.as_object().ok_or_else(|| invalid_input("value must be an object when schema exists"))?;
     for column in &schema.columns {
         if column.required && !object.contains_key(&column.name) {
             return Err(invalid_input(format!("missing required field '{}'", column.name)));
@@ -417,62 +453,71 @@ fn validate_value_against_schema(schema: &TableSchema, value: &Value) -> Result<
             let expected_kind = column.kind.as_str();
             let actual_kind = infer_kind(actual);
             if expected_kind != actual_kind && expected_kind != "string" {
-                if !(expected_kind == "number" && actual_kind == "bool") {
-                    return Err(invalid_input(format!("field '{}' expected type '{}' but got '{}'", column.name, expected_kind, actual_kind)));
-                }
+                return Err(invalid_input(format!("field '{}' expected type '{}' but got '{}'", column.name, expected_kind, actual_kind)));
             }
         }
     }
     Ok(())
 }
 
-fn parse_predicate(predicate: &str) -> Option<(String, String)> {
+fn parse_predicate(predicate: &str) -> Option<(String, String, String)> {
     let predicate = predicate.trim();
-    if predicate.is_empty() { return None; }
-    let mut operators = [">=", "<=", "!=", "==", "=", ">", "<", "~"];
-    let matched = operators.iter().filter_map(|op| predicate.find(op).map(|idx| (idx, op))).min_by_key(|(idx, _)| *idx)?;
-    let (idx, op) = matched;
+    if predicate.is_empty() {
+        return None;
+    }
+
+    let ops = [">=", "<=", "!=", "==", "=", ">", "<", "~"];
+    let mut best: Option<(usize, &str)> = None;
+    for op in ops {
+        if let Some(index) = predicate.find(op) {
+            match &best {
+                Some((current_index, _)) if index >= *current_index => {}
+                _ => best = Some((index, op)),
+            }
+        }
+    }
+    let (idx, op) = best?;
     let field = predicate[..idx].trim();
-    let value = predicate[idx + op.len()..].trim();
-    if field.is_empty() || value.is_empty() { return None; }
-    Some((field.to_string(), format!("{op}{value}")))
+    let raw_value = predicate[idx + op.len()..].trim();
+    if field.is_empty() || raw_value.is_empty() {
+        return None;
+    }
+    Some((field.to_string(), op.to_string(), raw_value.to_string()))
 }
 
-fn normalize_predicate_value(raw: &str) -> Value {
-    if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-        parsed
-    } else {
-        Value::String(raw.to_owned())
+fn parse_query_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or(Value::String(raw.to_string()))
+}
+
+fn row_matches_field(row: &Value, field: &str, op: &str, expected: &Value) -> bool {
+    let candidate = match row {
+        Value::Object(obj) => obj.get(field).cloned().unwrap_or(Value::Null),
+        _ if field == "value" => row.clone(),
+        _ => Value::Null,
+    };
+
+    match op {
+        "=" => candidate == *expected,
+        "==" => candidate == *expected,
+        "!=" => candidate != *expected,
+        ">" => compare_values(&candidate, expected) == std::cmp::Ordering::Greater,
+        "<" => compare_values(&candidate, expected) == std::cmp::Ordering::Less,
+        ">=" => compare_values(&candidate, expected) != std::cmp::Ordering::Less,
+        "<=" => compare_values(&candidate, expected) != std::cmp::Ordering::Greater,
+        "~" => match (&candidate, expected) {
+            (Value::String(actual), Value::String(expected_str)) => actual.to_ascii_lowercase().contains(&expected_str.to_ascii_lowercase()),
+            _ => false,
+        },
+        _ => candidate == *expected,
     }
 }
 
-fn row_matches(row: &Value, field: &str, expected: &Value) -> bool {
-    let field_value = match row {
-        Value::Object(obj) => obj.get(field).unwrap_or(&Value::Null),
-        _ => match field {
-            "value" => row,
-            _ => &Value::Null,
-        }
-    };
-
-    match expected {
-        Value::String(expected_str) => match field_value {
-            Value::String(actual) => actual == expected_str,
-            Value::Number(actual) => actual.to_string() == *expected_str,
-            Value::Bool(actual) => actual.to_string() == *expected_str,
-            Value::Null => expected_str == "null",
-            _ => false,
-        },
-        Value::Number(expected_num) => {
-            if let Some(actual_num) = field_value.as_f64() {
-                actual_num == expected_num.as_f64().unwrap_or_default()
-            } else {
-                false
-            }
-        }
-        Value::Bool(expected_bool) => field_value.as_bool() == Some(*expected_bool),
-        Value::Null => field_value.is_null(),
-        _ => field_value == expected,
+fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        _ => left.to_string().cmp(&right.to_string()),
     }
 }
 
@@ -485,13 +530,7 @@ fn compare_sort_value(left: &Value, right: &Value, field: &str) -> std::cmp::Ord
         Value::Object(obj) => obj.get(field).unwrap_or(&Value::Null),
         _ => right,
     };
-
-    match (left_value, right_value) {
-        (Value::Number(a), Value::Number(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        _ => left_value.to_string().cmp(&right_value.to_string()),
-    }
+    compare_values(left_value, right_value)
 }
 
 impl AsRef<Path> for SupernovaDb {
@@ -513,14 +552,22 @@ mod tests {
     }
 
     #[test]
-    fn schema_validation_and_query_ops_work() {
-        let path = temp_dir("schema");
-        let mut db = SupernovaDb::open(&path).unwrap();
-        db.create_table_with_schema("users", &["name".into(), "role".into(), "age".into()]).unwrap();
-        db.set("users", "alice".to_string(), json!({"name":"Alice","role":"admin","age":30})).unwrap();
-        db.set("users", "bob".to_string(), json!({"name":"Bob","role":"user","age":25})).unwrap();
-        assert_eq!(db.query("users", "role=admin").len(), 1);
-        assert_eq!(db.query("users", "age>=25").len(), 2);
+    fn rich_query_and_backup_restore_work() {
+        let path = temp_dir("rich_query");
+        {
+            let mut db = SupernovaDb::open(&path).unwrap();
+            db.create_table_with_schema("users", &["name".into(), "role".into(), "age".into()]).unwrap();
+            db.set("users", "alice".to_string(), json!({"name":"Alice","role":"admin","age":30})).unwrap();
+            db.set("users", "bob".to_string(), json!({"name":"Bob","role":"user","age":25})).unwrap();
+            db.create_index("users", "role").unwrap();
+            assert_eq!(db.query("users", "role=admin").len(), 1);
+            assert_eq!(db.query("users", "age>=25").len(), 2);
+            let backup_dir = std::env::temp_dir().join(format!("supernova_backup_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            db.backup(&backup_dir).unwrap();
+            let mut restored = SupernovaDb::open(&backup_dir).unwrap();
+            assert_eq!(restored.get("users", "alice"), Some(json!({"name":"Alice","role":"admin","age":30})));
+            fs::remove_dir_all(backup_dir).unwrap();
+        }
         fs::remove_dir_all(path).unwrap();
     }
 }

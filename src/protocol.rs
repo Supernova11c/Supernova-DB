@@ -85,11 +85,11 @@ fn decode_payload(frame: &[u8]) -> Result<&[u8], String> {
     if &frame[..4] != MAGIC {
         return Err("invalid protocol magic".to_string());
     }
-    let len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
-    if len > MAX_FRAME_SIZE {
+    let length = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
+    if length > MAX_FRAME_SIZE {
         return Err("frame exceeds maximum size".to_string());
     }
-    let end = HEADER_LEN.checked_add(len).ok_or_else(|| "frame length overflow".to_string())?;
+    let end = HEADER_LEN.checked_add(length).ok_or_else(|| "frame length overflow".to_string())?;
     if frame.len() != end {
         return Err("frame length does not match payload".to_string());
     }
@@ -112,11 +112,11 @@ fn read_payload<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     if &header[..4] != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid protocol magic"));
     }
-    let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-    if len > MAX_FRAME_SIZE {
+    let length = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+    if length > MAX_FRAME_SIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame exceeds maximum size"));
     }
-    let mut payload = vec![0u8; len];
+    let mut payload = vec![0u8; length];
     reader.read_exact(&mut payload)?;
     Ok(payload)
 }
@@ -126,7 +126,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_round_trip_works() {
+    fn request_roundtrip_works() {
         let req = Request {
             op: "ping".to_string(),
             ..Default::default()

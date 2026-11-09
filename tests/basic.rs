@@ -29,6 +29,7 @@ enum Commands {
     },
     DeleteTable { table: String },
     Tables,
+    Describe { table: String },
     Set { table: String, key: String, value: String },
     Get { table: String, key: String },
     Delete { table: String, key: String },
@@ -37,10 +38,17 @@ enum Commands {
         #[arg(long)] sort_by: Option<String>,
         #[arg(long)] limit: Option<usize>,
     },
-    Query { table: String, predicate: String },
+    Query {
+        table: String,
+        predicate: String,
+        #[arg(long)] sort_by: Option<String>,
+        #[arg(long)] limit: Option<usize>,
+    },
     CreateIndex { table: String, field: String },
     Indexes { table: String },
     Checkpoint,
+    Backup { destination: PathBuf },
+    Restore { source: PathBuf },
     Serve {
         #[arg(long, default_value = "127.0.0.1")] host: String,
         #[arg(long, default_value_t = 8080)] port: u16,
@@ -71,6 +79,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("{name}");
             }
         }
+        Commands::Describe { table } => {
+            let db = SupernovaDb::open(cli.db)?;
+            match db.describe(&table) {
+                Some(cols) => {
+                    for col in cols {
+                        println!("{}:{}:{}", col.name, col.kind, if col.required { "required" } else { "optional" });
+                    }
+                }
+                None => println!("<not found>"),
+            }
+        }
         Commands::Set { table, key, value } => {
             let mut db = SupernovaDb::open(cli.db)?;
             db.set(&table, key, parse_value(&value))?;
@@ -96,11 +115,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("{key}={row}");
             }
         }
-        Commands::Query { table, predicate } => {
+        Commands::Query { table, predicate, sort_by, limit } => {
             let db = SupernovaDb::open(cli.db)?;
             let rows = db.query(&table, &predicate);
-            for (key, value) in rows {
-                println!("{key}={value}");
+            let mut rows: Vec<_> = rows.into_iter().collect();
+            if let Some(field) = sort_by.as_deref() {
+                rows.sort_by(|a, b| compare_rows_field(&a.1, &b.1, field));
+            }
+            if let Some(limit) = limit {
+                rows.truncate(limit);
+            }
+            if rows.is_empty() {
+                println!("<no matches>");
+            } else {
+                for (key, value) in rows {
+                    println!("{key}={value}");
+                }
             }
         }
         Commands::CreateIndex { table, field } => {
@@ -119,6 +149,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             db.checkpoint()?;
             println!("OK");
         }
+        Commands::Backup { destination } => {
+            let db = SupernovaDb::open(cli.db)?;
+            db.backup(&destination)?;
+            println!("OK");
+        }
+        Commands::Restore { source } => {
+            let mut db = SupernovaDb::open(cli.db)?;
+            db.restore(&source)?;
+            println!("OK");
+        }
         Commands::Serve { host, port, token } => {
             serve(&host, port, cli.db, token)?;
         }
@@ -128,14 +168,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or(Value::String(raw.to_owned()))
+    serde_json::from_str(raw).unwrap_or(Value::String(raw.to_string()))
+}
+
+fn compare_rows_field(left: &Value, right: &Value, field: &str) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Object(a), Value::Object(b)) => a.get(field).unwrap_or(&Value::Null).to_string().cmp(&b.get(field).unwrap_or(&Value::Null).to_string()),
+        _ => left.to_string().cmp(&right.to_string()),
+    }
 }
 
 fn serve(host: &str, port: u16, path: PathBuf, token: Option<String>) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind((host, port))?;
-    let mut addr = listener.local_addr()?;
-    println!("Supernova DB listening on {}:{}", addr.ip(), addr.port());
     let db = Arc::new(Mutex::new(SupernovaDb::open(path)?));
+    println!("Supernova DB listening on {}:{}", host, port);
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
@@ -158,7 +204,7 @@ fn handle_client(mut stream: TcpStream, db: Arc<Mutex<SupernovaDb>>, token: Opti
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     let request = match protocol::read_request(&mut stream) {
-        Ok(req) => req,
+        Ok(request) => request,
         Err(error) => {
             return protocol::write_response(&mut stream, &protocol::Response {
                 ok: false,
@@ -193,7 +239,7 @@ fn execute_request(request: &protocol::Request, db: &Arc<Mutex<SupernovaDb>>) ->
         "ping" => Ok(("pong".to_string(), None, None)),
         "tables" => Ok(("ok".to_string(), None, Some(json!(db.table_names())))),
         "create_table" => {
-            if request.columns.as_ref().is_some_and(|v| !v.is_empty()) {
+            if request.columns.as_ref().is_some_and(|cols| !cols.is_empty()) {
                 db.create_table_with_schema(&request.table, &request.columns.clone().unwrap_or_default())
                     .map_err(|e| e.to_string())?;
             } else {
@@ -218,10 +264,7 @@ fn execute_request(request: &protocol::Request, db: &Arc<Mutex<SupernovaDb>>) ->
             Some(value) => Ok(("deleted".to_string(), Some(value), None)),
             None => Ok(("not found".to_string(), None, None)),
         },
-        "list" => {
-            let rows = db.list(&request.table, request.sort_by.as_deref(), request.limit);
-            Ok(("ok".to_string(), None, Some(json!(rows))))
-        }
+        "list" => Ok(("ok".to_string(), None, Some(json!(db.list(&request.table, request.sort_by.as_deref(), request.limit))))),
         "query" => {
             let predicate = request.query.clone().unwrap_or_else(|| request.field.clone().unwrap_or_default());
             let rows = db.query(&request.table, &predicate);
@@ -236,6 +279,16 @@ fn execute_request(request: &protocol::Request, db: &Arc<Mutex<SupernovaDb>>) ->
         "checkpoint" => {
             db.checkpoint().map_err(|e| e.to_string())?;
             Ok(("checkpoint complete".to_string(), None, None))
+        }
+        "backup" => {
+            let dest = request.key.clone();
+            db.backup(PathBuf::from(dest).as_path()).map_err(|e| e.to_string())?;
+            Ok(("backup complete".to_string(), None, None))
+        }
+        "restore" => {
+            let src = request.key.clone();
+            db.restore(PathBuf::from(src).as_path()).map_err(|e| e.to_string())?;
+            Ok(("restore complete".to_string(), None, None))
         }
         _ => Err(format!("unsupported operation: {}", request.op)),
     }
