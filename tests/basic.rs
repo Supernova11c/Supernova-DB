@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "supernova-db", about = "Advanced custom Rust database with a custom protocol")]
+#[command(name = "supernova-db", about = "Advanced custom Rust database with transactions and query support")]
 struct Cli {
     #[arg(long, default_value = "supernova_data")]
     db: PathBuf,
@@ -34,6 +34,10 @@ enum Commands {
     List {
         table: String,
     },
+    Query {
+        table: String,
+        predicate: String,
+    },
     Tables,
     CreateTable {
         table: String,
@@ -41,6 +45,9 @@ enum Commands {
     DeleteTable {
         table: String,
     },
+    Begin,
+    Commit,
+    Rollback,
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -77,9 +84,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::List { table } => {
             let db = SupernovaDb::open(cli.db)?;
-            let rows = db.list(&table);
+            for (key, value) in db.list(&table) {
+                println!("{key}={value}");
+            }
+        }
+        Commands::Query { table, predicate } => {
+            let db = SupernovaDb::open(cli.db)?;
+            let rows = db.query(&table, &predicate);
             if rows.is_empty() {
-                println!("<empty>");
+                println!("<no matches>");
             } else {
                 for (key, value) in rows {
                     println!("{key}={value}");
@@ -103,6 +116,21 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(_) => println!("OK"),
                 None => println!("<not found>"),
             }
+        }
+        Commands::Begin => {
+            let mut db = SupernovaDb::open(cli.db)?;
+            let _tx = db.begin_transaction()?;
+            println!("transaction started");
+        }
+        Commands::Commit => {
+            let mut db = SupernovaDb::open(cli.db)?;
+            let _tx = db.begin_transaction()?;
+            println!("transaction started; commit requires an active transaction object in code, not CLI mode");
+        }
+        Commands::Rollback => {
+            let mut db = SupernovaDb::open(cli.db)?;
+            let _tx = db.begin_transaction()?;
+            println!("transaction started; rollback requires an active transaction object in code, not CLI mode");
         }
         Commands::Serve { host, port, token } => {
             serve(&host, port, cli.db, token)?;
@@ -244,6 +272,17 @@ fn serve(host: &str, port: u16, db_path: PathBuf, required_token: Option<String>
             "list" => {
                 let db = SupernovaDb::open(&db_path)?;
                 let rows = db.list(&request.table);
+                protocol::Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    value: None,
+                    data: Some(serde_json::json!({"table": request.table, "rows": rows })),
+                }
+            }
+            "query" => {
+                let db = SupernovaDb::open(&db_path)?;
+                let predicate = request.query.unwrap_or_default();
+                let rows = db.query(&request.table, &predicate);
                 protocol::Response {
                     ok: true,
                     message: "ok".to_string(),

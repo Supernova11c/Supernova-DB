@@ -8,6 +8,7 @@ pub struct Request {
     pub table: String,
     pub key: String,
     pub value: Option<serde_json::Value>,
+    pub query: Option<String>,
     pub token: Option<String>,
 }
 

@@ -7,9 +7,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TableMeta {
+    pub columns: Vec<String>,
+    pub rows: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DbSnapshot {
     pub version: u32,
-    pub tables: HashMap<String, BTreeMap<String, Value>>,
+    pub tables: HashMap<String, TableMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,12 +26,18 @@ struct WalEvent {
     pub value: Option<Value>,
 }
 
+pub struct Transaction<'a> {
+    db: &'a mut SupernovaDb,
+    snapshot: HashMap<String, TableMeta>,
+    active: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SupernovaDb {
     root: PathBuf,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
-    tables: HashMap<String, BTreeMap<String, Value>>,
+    tables: HashMap<String, TableMeta>,
 }
 
 impl SupernovaDb {
@@ -48,8 +60,16 @@ impl SupernovaDb {
         Ok(db)
     }
 
+    pub fn begin_transaction(&mut self) -> Result<Transaction<'_>, Box<dyn Error>> {
+        Ok(Transaction {
+            db: self,
+            snapshot: self.tables.clone(),
+            active: true,
+        })
+    }
+
     pub fn create_table(&mut self, table: &str) -> Result<(), Box<dyn Error>> {
-        self.tables.entry(table.to_string()).or_default();
+        self.tables.entry(table.to_string()).or_insert_with(TableMeta::default);
         self.append_wal(&WalEvent {
             op: "create_table".to_string(),
             table: table.to_string(),
@@ -60,7 +80,7 @@ impl SupernovaDb {
         Ok(())
     }
 
-    pub fn delete_table(&mut self, table: &str) -> Result<Option<BTreeMap<String, Value>>, Box<dyn Error>> {
+    pub fn delete_table(&mut self, table: &str) -> Result<Option<TableMeta>, Box<dyn Error>> {
         let removed = self.tables.remove(table);
         self.append_wal(&WalEvent {
             op: "delete_table".to_string(),
@@ -84,8 +104,13 @@ impl SupernovaDb {
         key: String,
         value: Value,
     ) -> Result<(), Box<dyn Error>> {
-        let table_entries = self.tables.entry(table.to_string()).or_default();
-        table_entries.insert(key.clone(), value.clone());
+        let table_meta = self.tables.entry(table.to_string()).or_insert_with(TableMeta::default);
+        table_meta.rows.insert(key.clone(), value.clone());
+        for column in extract_columns(&value) {
+            if !table_meta.columns.iter().any(|existing| existing == &column) {
+                table_meta.columns.push(column);
+            }
+        }
 
         self.append_wal(&WalEvent {
             op: "set".to_string(),
@@ -101,14 +126,11 @@ impl SupernovaDb {
     pub fn get(&self, table: &str, key: &str) -> Option<Value> {
         self.tables
             .get(table)
-            .and_then(|rows| rows.get(key).cloned())
+            .and_then(|meta| meta.rows.get(key).cloned())
     }
 
     pub fn delete(&mut self, table: &str, key: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        let removed = self
-            .tables
-            .get_mut(table)
-            .and_then(|rows| rows.remove(key));
+        let removed = self.tables.get_mut(table).and_then(|meta| meta.rows.remove(key));
 
         self.append_wal(&WalEvent {
             op: "delete".to_string(),
@@ -125,8 +147,8 @@ impl SupernovaDb {
         let mut rows: Vec<_> = self
             .tables
             .get(table)
-            .map(|entries| {
-                entries
+            .map(|meta| {
+                meta.rows
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<Vec<_>>()
@@ -135,6 +157,26 @@ impl SupernovaDb {
 
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         rows
+    }
+
+    pub fn query(&self, table: &str, predicate: &str) -> Vec<(String, Value)> {
+        let mut results = Vec::new();
+        let Some((field, expected)) = predicate.split_once('=') else {
+            return results;
+        };
+
+        let normalized_expected = expected.trim();
+
+        if let Some(meta) = self.tables.get(table) {
+            for (key, value) in &meta.rows {
+                if matches_field(value, field, normalized_expected) {
+                    results.push((key.clone(), value.clone()));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
     }
 
     fn load_snapshot(&mut self) -> Result<(), Box<dyn Error>> {
@@ -154,7 +196,7 @@ impl SupernovaDb {
 
     fn persist_snapshot(&self) -> Result<(), Box<dyn Error>> {
         let snapshot = DbSnapshot {
-            version: 2,
+            version: 3,
             tables: self.tables.clone(),
         };
 
@@ -193,18 +235,25 @@ impl SupernovaDb {
             let event: WalEvent = serde_json::from_str(&line)?;
             match event.op.as_str() {
                 "create_table" => {
-                    self.tables.entry(event.table).or_default();
+                    self.tables.entry(event.table).or_insert_with(TableMeta::default);
                 }
                 "delete_table" => {
                     self.tables.remove(&event.table);
                 }
                 "set" => {
-                    let table = self.tables.entry(event.table).or_default();
-                    table.insert(event.key, event.value.unwrap_or(Value::Null));
+                    let table = self.tables.entry(event.table).or_insert_with(TableMeta::default);
+                    if let Some(value) = event.value {
+                        table.rows.insert(event.key, value.clone());
+                        for column in extract_columns(&value) {
+                            if !table.columns.iter().any(|existing| existing == &column) {
+                                table.columns.push(column);
+                            }
+                        }
+                    }
                 }
                 "delete" => {
                     if let Some(table) = self.tables.get_mut(&event.table) {
-                        table.remove(&event.key);
+                        table.rows.remove(&event.key);
                     }
                 }
                 _ => {}
@@ -215,8 +264,113 @@ impl SupernovaDb {
     }
 }
 
+impl<'a> Transaction<'a> {
+    pub fn set(&mut self, table: &str, key: String, value: Value) -> Result<(), Box<dyn Error>> {
+        let table_meta = self.snapshot.entry(table.to_string()).or_insert_with(TableMeta::default);
+        table_meta.rows.insert(key, value.clone());
+        for column in extract_columns(&value) {
+            if !table_meta.columns.iter().any(|existing| existing == &column) {
+                table_meta.columns.push(column);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, table: &str, key: &str) -> Option<Value> {
+        self.snapshot
+            .get(table)
+            .and_then(|meta| meta.rows.get(key).cloned())
+    }
+
+    pub fn delete(&mut self, table: &str, key: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        let removed = self.snapshot.get_mut(table).and_then(|meta| meta.rows.remove(key));
+        Ok(removed)
+    }
+
+    pub fn commit(mut self) -> Result<(), Box<dyn Error>> {
+        if !self.active {
+            return Ok(());
+        }
+
+        self.db.tables = self.snapshot.clone();
+        self.db.persist_snapshot()?;
+        self.active = false;
+        Ok(())
+    }
+
+    pub fn rollback(mut self) -> Result<(), Box<dyn Error>> {
+        self.active = false;
+        Ok(())
+    }
+}
+
 impl AsRef<Path> for SupernovaDb {
     fn as_ref(&self) -> &Path {
         &self.root
+    }
+}
+
+fn extract_columns(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(map) => map
+            .keys()
+            .cloned()
+            .chain(map.values().flat_map(extract_columns))
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(extract_columns).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn matches_field(value: &Value, field: &str, expected: &str) -> bool {
+    match value {
+        Value::Object(obj) => {
+            if let Some(actual) = obj.get(field) {
+                match actual {
+                    Value::String(s) => s == expected,
+                    Value::Number(n) => n.to_string() == expected,
+                    Value::Bool(b) => b.to_string() == expected,
+                    Value::Null => expected == "null",
+                    _ => actual.to_string() == expected,
+                }
+            } else {
+                false
+            }
+        }
+        Value::String(s) => s == expected && field == "value",
+        Value::Number(n) => n.to_string() == expected && field == "value",
+        Value::Bool(b) => b.to_string() == expected && field == "value",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SupernovaDb;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn transaction_and_query_work() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = format!("/tmp/supernova_db_tx_{unique}");
+
+        let mut db = SupernovaDb::open(&dir).unwrap();
+        db.create_table("users").unwrap();
+        db.set("users", "alice".into(), json!({"name": "Alice", "role": "admin"})).unwrap();
+
+        let mut tx = db.begin_transaction().unwrap();
+        tx.set("users", "bob".into(), json!({"name": "Bob", "role": "user"})).unwrap();
+        assert_eq!(tx.get("users", "bob"), Some(json!({"name": "Bob", "role": "user"})));
+        tx.commit().unwrap();
+
+        let rows = db.query("users", "role=admin");
+        assert!(!rows.is_empty());
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
